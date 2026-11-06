@@ -147,3 +147,39 @@ vite.config.ts.timestamp-*
 
 # Turbo Repo
 .turbo
+
+# Python virtual environments
+ml-service/venv/
+venv/
+
+# Environment secrets
+.env
+ml-service/.env
+
+# Python cache
+__pycache__/
+*.pyc
+ml-service/__pycache__/
+
+# YOLO model weights and training outputs
+*.pt
+ml-service/runs/
+
+# Other generated files
+.DS_Store
+# ML service
+ml-service/venv/
+ml-service/.env
+ml-service/datasets/
+ml-service/__pycache__/
+ml-service/runs/
+
+# Python
+__pycache__/
+*.pyc
+
+# Model weights
+*.pt
+
+# Environment files
+.env

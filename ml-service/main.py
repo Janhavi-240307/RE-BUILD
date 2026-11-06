@@ -1,21 +1,24 @@
 
 import os
 import random
+import json
 from functools import lru_cache
 
 import cv2
 import numpy as np
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from ultralytics import YOLO
 
-# Load environment variables
-load_dotenv()
+from material_analysis import analyze_materials
+
 
 # ==========================================
 # CONFIGURATION
 # ==========================================
+
+load_dotenv()
 
 MODEL_PATH = os.getenv("MODEL_PATH", "yolov8n.pt")
 MOCK_MODE = os.getenv("MOCK_MODE", "true").lower() == "true"
@@ -32,14 +35,18 @@ CLASS_MAP = {
 
 VALID_MATERIALS = list(CLASS_MAP.values())
 
+
 # ==========================================
 # FASTAPI APP
 # ==========================================
 
 app = FastAPI(
     title="RE:BUILD Material Detection API",
-    description="Construction material detection using YOLO",
-    version="1.0.0"
+    description=(
+        "Construction material detection, "
+        "material analysis and recovery prediction"
+    ),
+    version="1.3.0"
 )
 
 origins = os.getenv(
@@ -55,12 +62,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 # ==========================================
 # LOAD YOLO MODEL
 # ==========================================
 
 @lru_cache(maxsize=1)
 def get_model():
+
     if not os.path.exists(MODEL_PATH):
         raise FileNotFoundError(
             f"Model weights not found: {MODEL_PATH}"
@@ -234,6 +243,69 @@ def run_yolo(image, width, height):
 
 
 # ==========================================
+# CONDITION INPUT VALIDATION
+# ==========================================
+
+def validate_material_conditions(material_conditions):
+
+    if material_conditions is None:
+        return {}
+
+    try:
+        conditions = json.loads(material_conditions)
+
+    except json.JSONDecodeError:
+        raise HTTPException(
+            status_code=400,
+            detail="material_conditions must contain valid JSON."
+        )
+
+    if not isinstance(conditions, dict):
+        raise HTTPException(
+            status_code=400,
+            detail="material_conditions must be a JSON object."
+        )
+
+    for material, values in conditions.items():
+
+        if material not in VALID_MATERIALS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported material: {material}"
+            )
+
+        if not isinstance(values, dict):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Conditions for {material} must be an object."
+            )
+
+        condition = values.get("condition")
+        contamination = values.get("contamination")
+
+        if condition not in [
+            "intact",
+            "damaged",
+            "mixed"
+        ]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid condition for {material}."
+            )
+
+        if contamination not in [
+            "low",
+            "high"
+        ]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid contamination for {material}."
+            )
+
+    return conditions
+
+
+# ==========================================
 # API ENDPOINTS
 # ==========================================
 
@@ -242,8 +314,9 @@ def home():
 
     return {
         "project": "RE:BUILD",
-        "service": "ML Material Detection",
-        "status": "running"
+        "service": "ML Material Detection, Analysis and Recovery API",
+        "status": "running",
+        "version": "1.3.0"
     }
 
 
@@ -257,29 +330,62 @@ def health():
     }
 
 
+# ==========================================
+# COMPLETE ML PIPELINE
+# ==========================================
+
 @app.post("/detect")
 async def detect_materials(
-    file: UploadFile = File(...)
+
+    file: UploadFile = File(...),
+
+    material_conditions: str = Form(default="{}")
+
 ):
 
     image, width, height = await read_image(file)
 
+    conditions = validate_material_conditions(
+        material_conditions
+    )
+
     try:
 
+        # STEP 1: YOLO MATERIAL DETECTION
+
         if MOCK_MODE:
-            detections = mock_detection(width, height)
+
+            detections = mock_detection(
+                width,
+                height
+            )
 
         else:
+
             detections = run_yolo(
                 image,
                 width,
                 height
             )
 
+        # STEP 2: MATERIAL ANALYSIS
+        # STEP 3: RECOVERY PREDICTION
+
+        material_analysis = analyze_materials(
+            detections,
+            conditions
+        )
+
+        # STEP 4: FINAL RESPONSE
+
         return {
-            "detections": detections,
+            "success": True,
+            "project": "RE:BUILD",
             "image_width": width,
-            "image_height": height
+            "image_height": height,
+            "detections": detections,
+            "material_analysis": material_analysis,
+            "analysis_status": "completed"
         }
 
     except HTTPException:
@@ -291,3 +397,6 @@ async def detect_materials(
             status_code=500,
             detail=f"Detection failed: {str(error)}"
         )
+
+
+

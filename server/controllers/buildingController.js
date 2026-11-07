@@ -1,91 +1,121 @@
 const fs = require("fs");
 const path = require("path");
+const mongoose = require("mongoose");
 const Building = require("../models/Building");
-const Recycler = require("../models/Recycler");
 const { analyzeImages } = require("../services/mlService");
-const { calculatePassport } = require("../services/passportEngine");
 
-const calculateDistance = (lat1, lon1, lat2, lon2) => {
-    const radians = value => value * Math.PI / 180;
-    const dLat = radians(lat2 - lat1);
-    const dLon = radians(lon2 - lon1);
-    const a = Math.sin(dLat / 2) ** 2 + Math.cos(radians(lat1)) * Math.cos(radians(lat2)) * Math.sin(dLon / 2) ** 2;
-    return 6371 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+const parseCoordinates = (value, min, max, label) => {
+    if (value === undefined || value === "") return null;
+    const number = Number(value);
+    if (!Number.isFinite(number) || number < min || number > max) throw new Error(`Invalid ${label}`);
+    return number;
+};
+
+const parseConditions = value => {
+    if (!value) return {};
+    let parsed;
+    try { parsed = typeof value === "string" ? JSON.parse(value) : value; }
+    catch { throw new Error("material_conditions must be valid JSON."); }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("material_conditions must be a JSON object.");
+    return parsed;
+};
+
+const mapBox = box => {
+    if (Array.isArray(box) && box.length === 4) return { x: Number(box[0]), y: Number(box[1]), width: Number(box[2]) - Number(box[0]), height: Number(box[3]) - Number(box[1]) };
+    if (box && typeof box === "object") return { x: Number(box.x) || 0, y: Number(box.y) || 0, width: Number(box.width) || 0, height: Number(box.height) || 0 };
+    return undefined;
 };
 
 const normalizeDetections = items => items.map(item => ({
     material: String(item.material || "").trim().toLowerCase(),
     confidence: Math.max(0, Math.min(1, Number(item.confidence) || 0)),
-    areaPct: Math.max(0, Math.min(100, Number(item.areaPct ?? item.area_pct) || 0)),
-    box: item.box || null
+    areaPct: Math.max(0, Math.min(100, Number(item.area_pct ?? item.areaPct) || 0)),
+    box: mapBox(item.box),
+    sourceImage: item.sourceImage || ""
 })).filter(item => item.material);
 
-exports.createBuildingAnalysis = async (req, res, next) => {
+const buildMaterialRecords = materialAnalysis => Object.entries(materialAnalysis?.material_summary || {}).map(([material, data]) => {
+    const recovery = data.recovery || {};
+    return {
+        material,
+        areaPct: Math.min(100, Number(data.visible_area_pct_sum) || 0),
+        confidence: Number(data.average_confidence) || 0,
+        estimatedQtyTonnes: null,
+        condition: data.condition || "Assessment required",
+        contamination: data.contamination || "Not provided",
+        pathway: recovery.recommendation || "Further inspection required",
+        recoveryMethod: recovery.method || "",
+        recoveryReason: recovery.reason || "",
+        assessmentType: data.assessment_type || "",
+        requiresExpertInspection: data.requires_expert_inspection !== false,
+        co2SavedKg: null
+    };
+});
+
+exports.createBuilding = async (req, res, next) => {
+    try {
+        const { name, buildingName, approximateAreaSqM, totalAreaSqm, address = "", city = "", state = "", buildingType = "Other" } = req.body;
+        const label = String(name || buildingName || "").trim();
+        const area = Number(approximateAreaSqM ?? totalAreaSqm);
+        if (!label || !Number.isFinite(area) || area <= 0) return res.status(400).json({ success: false, message: "Building name and a valid positive area are required." });
+        const latitude = parseCoordinates(req.body.latitude, -90, 90, "latitude");
+        const longitude = parseCoordinates(req.body.longitude, -180, 180, "longitude");
+        const building = await Building.create({
+            user: req.user.id, name: label, approximateAreaSqM: area, buildingType,
+            location: { address, city, state, latitude, longitude }, analysisStatus: "processing"
+        });
+        return res.status(201).json({ success: true, message: "Building registered.", building });
+    } catch (error) { return next(error); }
+};
+
+const runBuildingAnalysis = async (req, res, next, buildingId = null) => {
     let building;
     try {
-        if (!req.files || req.files.length === 0) {
-            return res.status(400).json({ success: false, message: "Upload at least one building image" });
-        }
-        const { name, buildingName, totalAreaSqm, approximateAreaSqM, address, city, state, latitude, longitude, buildingType } = req.body;
-        const area = Number(approximateAreaSqM ?? totalAreaSqm);
-        const buildingLabel = String(name || buildingName || "").trim();
-        if (!buildingLabel || !Number.isFinite(area) || area <= 0) {
-            return res.status(400).json({ success: false, message: "Building name and a valid positive area are required" });
-        }
-        const lat = latitude === undefined || latitude === "" ? null : Number(latitude);
-        const lng = longitude === undefined || longitude === "" ? null : Number(longitude);
-        if ((lat !== null && (!Number.isFinite(lat) || lat < -90 || lat > 90)) || (lng !== null && (!Number.isFinite(lng) || lng < -180 || lng > 180))) {
-            return res.status(400).json({ success: false, message: "Invalid latitude or longitude" });
-        }
+        if (!req.files?.length) return res.status(400).json({ success: false, message: "Upload at least one building image." });
+        if (buildingId && !mongoose.isValidObjectId(buildingId)) return res.status(400).json({ success: false, message: "Invalid building ID." });
+        building = buildingId
+            ? await Building.findOne({ _id: buildingId, user: req.user.id })
+            : null;
+        if (buildingId && !building) return res.status(404).json({ success: false, message: "Building not found." });
 
-        building = await Building.create({
-            user: req.user.id,
-            name: buildingLabel,
-            approximateAreaSqM: area,
-            buildingType: buildingType || "Other",
-            location: { address: address || "", city: city || "", state: state || "", latitude: lat, longitude: lng },
-            imagePaths: req.files.map(file => `/uploads/${file.filename}`),
-            analysisStatus: "processing"
-        });
-
-        const detections = normalizeDetections(await analyzeImages(req.files));
-        const passport = calculatePassport(detections, area);
-        let materials = passport.materials;
-
-        if (lat !== null && lng !== null) {
-            const recyclers = await Recycler.find({ isActive: true });
-            materials = materials.map(material => {
-                const match = recyclers
-                    .filter(recycler => recycler.acceptedMaterials.includes(material.material))
-                    .map(recycler => {
-                        const [recyclerLng, recyclerLat] = recycler.location.coordinates;
-                        return { recycler, distance: calculateDistance(lat, lng, recyclerLat, recyclerLng) };
-                    })
-                    .sort((a, b) => a.distance - b.distance)[0];
-                return { ...material, matchedRecycler: match ? match.recycler._id : null };
-            });
+        if (!building) {
+            const { name, buildingName, approximateAreaSqM, totalAreaSqm, address = "", city = "", state = "", buildingType = "Other" } = req.body;
+            const label = String(name || buildingName || "").trim();
+            const area = Number(approximateAreaSqM ?? totalAreaSqm);
+            if (!label || !Number.isFinite(area) || area <= 0) return res.status(400).json({ success: false, message: "Building name and a valid positive area are required." });
+            building = await Building.create({ user: req.user.id, name: label, approximateAreaSqM: area, buildingType, location: { address, city, state, latitude: parseCoordinates(req.body.latitude, -90, 90, "latitude"), longitude: parseCoordinates(req.body.longitude, -180, 180, "longitude") }, analysisStatus: "processing" });
         }
 
-        building.detections = detections;
-        building.materials = materials;
-        building.totalEstimatedQuantityTonnes = passport.totalEstimatedQuantityTonnes;
-        building.totalCO2SavedKg = passport.totalCO2SavedKg;
-        building.circularityScore = passport.circularityScore;
-        building.recoveryRatePct = passport.recoveryRatePct;
-        building.analysisStatus = "completed";
+        building.analysisStatus = "processing";
+        building.analysisError = "";
+        building.imagePaths = [...(building.imagePaths || []), ...req.files.map(file => `/uploads/${file.filename}`)];
         await building.save();
 
+        const conditions = parseConditions(req.body.material_conditions);
+        const mlResult = await analyzeImages(req.files, conditions);
+        const detections = normalizeDetections(mlResult.detections);
+        building.detections = detections;
+        building.materialAnalysis = mlResult.materialAnalysis;
+        building.mlImageResults = mlResult.imageResults;
+        building.materials = buildMaterialRecords(mlResult.materialAnalysis);
+        // Quantity, recovery-rate and CO2 calculations are intentionally not fabricated.
+        building.estimatesAvailable = false;
+        building.totalEstimatedQuantityTonnes = 0;
+        building.totalCO2SavedKg = 0;
+        building.circularityScore = 0;
+        building.recoveryRatePct = 0;
+        building.analysisStatus = "completed";
+        await building.save();
         const result = await Building.findOne({ _id: building._id, user: req.user.id }).populate("materials.matchedRecycler");
-        return res.status(201).json({ success: true, message: "Building analysis completed", building: result });
+        return res.status(200).json({ success: true, message: "ML analysis completed and saved.", building: result });
     } catch (error) {
-        if (building) {
-            building.analysisStatus = "failed";
-            building.analysisError = error.message;
-            await building.save().catch(() => {});
-        }
+        if (building) { building.analysisStatus = "failed"; building.analysisError = error.message; await building.save().catch(() => {}); }
         return next(error);
     }
 };
+
+exports.createBuildingAnalysis = (req, res, next) => runBuildingAnalysis(req, res, next);
+exports.analyzeExistingBuilding = (req, res, next) => runBuildingAnalysis(req, res, next, req.params.id);
 
 exports.getMyBuildings = async (req, res, next) => {
     try {
@@ -106,10 +136,7 @@ exports.deleteBuilding = async (req, res, next) => {
     try {
         const building = await Building.findOneAndDelete({ _id: req.params.id, user: req.user.id });
         if (!building) return res.status(404).json({ success: false, message: "Building not found" });
-        for (const image of building.imagePaths || []) {
-            const filename = path.basename(image);
-            fs.unlink(path.join(__dirname, "../uploads", filename), () => {});
-        }
+        for (const image of building.imagePaths || []) fs.unlink(path.join(__dirname, "../uploads", path.basename(image)), () => {});
         res.status(200).json({ success: true, message: "Building deleted successfully" });
     } catch (error) { next(error); }
 };
